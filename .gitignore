@@ -17,6 +17,10 @@ env/
 
 # Experiment outputs and model artifacts
 results/
+!results/
+results/**
+!results/**/
+!results/**/summary*.json
 runs/
 checkpoints/
 wandb/
