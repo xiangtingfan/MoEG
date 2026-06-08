@@ -249,13 +249,17 @@ class SharedResidualMoGE(nn.Module):
         )
         self.classifier = nn.Linear(dim, num_classes)
 
-    def forward(self, x, return_router=False):
+    def forward(self, x, return_router=False, return_features=False):
         z_shared = self.shared_encoder(x)
         z_final, router_weights = self.residual_moe(z_shared)
         logits = self.classifier(z_final)
 
+        if return_router and return_features:
+            return logits, [router_weights], z_final
         if return_router:
             return logits, [router_weights]
+        if return_features:
+            return logits, z_final
         return logits
 
 

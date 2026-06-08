@@ -7,7 +7,14 @@ from torch import nn
 from torch.utils.data import DataLoader
 
 from data.eeg_dataset import build_datasets_for_loso
-from losses.router_losses import router_balance_loss, router_entropy_loss
+from losses.router_losses import (
+    compute_mmd_loss,
+    compute_subject_cmmd_loss,
+    router_balance_loss,
+    router_entropy_loss,
+    router_importance_loss,
+    router_load_loss,
+)
 from models.sample_style_sparse_moge import SampleStyleSparseMoGE
 from models.shared_residual_moe import SharedResidualMoGE
 from utils.io_utils import ensure_dir, save_json, save_numpy
@@ -29,31 +36,77 @@ def resolve_device(device_arg):
 def train_one_epoch(model, loader, optimizer, criterion, device, args):
     model.train()
     total_loss = 0.0
+    total_loss_cls = 0.0
+    total_loss_importance = 0.0
+    total_loss_load = 0.0
+    total_loss_mmd = 0.0
+    total_loss_cmmd = 0.0
+    total_loss_balance = 0.0
+    total_loss_entropy = 0.0
     total_correct = 0
     total_samples = 0
 
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
         y = batch["y"].to(device, non_blocking=True)
+        subject_ids = batch["subject_id"].to(device, non_blocking=True)
         assert_eeg_shape(x)
 
         optimizer.zero_grad(set_to_none=True)
-        logits, router_weights_all = model(x, return_router=True)
+        logits, router_weights_all, features = model(x, return_router=True, return_features=True)
         loss_cls = criterion(logits, y)
-        loss_balance = router_balance_loss(router_weights_all).to(device)
-        loss_entropy = router_entropy_loss(router_weights_all).to(device)
-        loss = loss_cls + args.lambda_balance * loss_balance + args.lambda_entropy * loss_entropy
+        loss_mmd = loss_cls.new_tensor(0.0)
+        loss_cmmd = loss_cls.new_tensor(0.0)
+        if args.lambda_mmd != 0:
+            loss_mmd = compute_mmd_loss(features, subject_ids).to(device)
+        if args.lambda_cmmd != 0:
+            loss_cmmd = compute_subject_cmmd_loss(features, y, subject_ids, args.num_classes).to(device)
+        loss_importance = loss_cls.new_tensor(0.0)
+        loss_load = loss_cls.new_tensor(0.0)
+        loss_balance = loss_cls.new_tensor(0.0)
+        loss_entropy = loss_cls.new_tensor(0.0)
+        if args.router_loss_type == "legacy":
+            loss_balance = router_balance_loss(router_weights_all).to(device)
+            loss_entropy = router_entropy_loss(router_weights_all).to(device)
+            loss_router_balance = loss_balance
+            loss_router_entropy = loss_entropy
+        else:
+            loss_importance = router_importance_loss(router_weights_all).to(device)
+            loss_load = router_load_loss(router_weights_all).to(device)
+            loss_router_balance = loss_importance
+            loss_router_entropy = loss_load
+        loss = (
+            loss_cls
+            + args.lambda_balance * loss_router_balance
+            + args.lambda_entropy * loss_router_entropy
+            + args.lambda_mmd * loss_mmd
+            + args.lambda_cmmd * loss_cmmd
+        )
         loss.backward()
         optimizer.step()
 
         batch_size = y.size(0)
         preds = logits.argmax(dim=-1)
         total_loss += float(loss.item()) * batch_size
+        total_loss_cls += float(loss_cls.item()) * batch_size
+        total_loss_importance += float(loss_importance.item()) * batch_size
+        total_loss_load += float(loss_load.item()) * batch_size
+        total_loss_mmd += float(loss_mmd.item()) * batch_size
+        total_loss_cmmd += float(loss_cmmd.item()) * batch_size
+        total_loss_balance += float(loss_balance.item()) * batch_size
+        total_loss_entropy += float(loss_entropy.item()) * batch_size
         total_correct += int((preds == y).sum().item())
         total_samples += batch_size
 
     return {
         "loss": total_loss / max(total_samples, 1),
+        "loss_cls": total_loss_cls / max(total_samples, 1),
+        "loss_importance": total_loss_importance / max(total_samples, 1),
+        "loss_load": total_loss_load / max(total_samples, 1),
+        "loss_mmd": total_loss_mmd / max(total_samples, 1),
+        "loss_cmmd": total_loss_cmmd / max(total_samples, 1),
+        "loss_balance_legacy": total_loss_balance / max(total_samples, 1),
+        "loss_entropy_legacy": total_loss_entropy / max(total_samples, 1),
         "acc": total_correct / max(total_samples, 1),
     }
 
@@ -186,11 +239,22 @@ def train_one_target(args, target_subject=None):
             torch.save(model.state_dict(), os.path.join(target_dir, "best_model.pt"))
 
         print(
-            "epoch={epoch} train_loss={train_loss:.6f} train_acc={train_acc:.6f} "
+            "epoch={epoch} train_loss={train_loss:.6f} "
+            "loss_cls={loss_cls:.6f} loss_importance={loss_importance:.6f} "
+            "loss_load={loss_load:.6f} loss_mmd={loss_mmd:.6f} loss_cmmd={loss_cmmd:.6f} "
+            "loss_balance_legacy={loss_balance_legacy:.6f} "
+            "loss_entropy_legacy={loss_entropy_legacy:.6f} train_acc={train_acc:.6f} "
             "target_acc={target_acc:.6f} target_macro_f1={target_macro_f1:.6f} "
             "target_kappa={target_kappa:.6f} best_target_acc={best_target_acc:.6f}".format(
                 epoch=epoch,
                 train_loss=train_metrics["loss"],
+                loss_cls=train_metrics["loss_cls"],
+                loss_importance=train_metrics["loss_importance"],
+                loss_load=train_metrics["loss_load"],
+                loss_mmd=train_metrics["loss_mmd"],
+                loss_cmmd=train_metrics["loss_cmmd"],
+                loss_balance_legacy=train_metrics["loss_balance_legacy"],
+                loss_entropy_legacy=train_metrics["loss_entropy_legacy"],
                 train_acc=train_metrics["acc"],
                 target_acc=target_metrics["acc"],
                 target_macro_f1=target_metrics["macro_f1"],
@@ -267,6 +331,9 @@ def build_arg_parser():
     parser.add_argument("--nonnegative_adjacency", action="store_true")
     parser.add_argument("--lambda_balance", type=float, default=0.05)
     parser.add_argument("--lambda_entropy", type=float, default=0.01)
+    parser.add_argument("--lambda_mmd", type=float, default=0.0)
+    parser.add_argument("--lambda_cmmd", type=float, default=0.1)
+    parser.add_argument("--router_loss_type", type=str, choices=["classic", "legacy"], default="classic")
     parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_dir", type=str, required=True)

@@ -485,7 +485,7 @@ class SampleStyleSparseMoGE(nn.Module):
 
         return adjacency
 
-    def forward(self, x, return_router=False):
+    def forward(self, x, return_router=False, return_features=False):
         """
         杈撳叆:
             x: [N, T, V, C]
@@ -564,10 +564,15 @@ class SampleStyleSparseMoGE(nn.Module):
         else:
             x = x[:, 0]
 
-        out = self.fc(x)
+        features = x
+        out = self.fc(features)
 
+        if return_router and return_features:
+            return out, router_weights_all, features
         if return_router:
             return out, router_weights_all
+        if return_features:
+            return out, features
 
         return out
 
