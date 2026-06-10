@@ -125,78 +125,96 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 
-class SampleStyleTopKRouter(nn.Module):
-    """
-    Sample-style top-k sparse router
-    鏍锋湰椋庢牸 top-k 绋€鐤忚矾鐢卞櫒
+class ChannelWiseTemporalAttention(nn.Module):
+    def __init__(self, hidden_dim, num_heads=2, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
 
-    鏍稿績鎬濇兂锛?    - 涓嶄娇鐢?subject_id锛?    - 鏍规嵁 EEG 鏍锋湰鑷韩鐨勫叏灞€椋庢牸鐗瑰緛鐢熸垚 expert 鏉冮噸锛?    - 姣忎釜鏍锋湰鍙縺娲?top-k 涓?expert锛?    - 淇濈暀 MoE / GMoE 鐨?sparse expert 鎬濇兂銆?
-    杈撳叆:
-        y: [N, T, P, F]
-           N = batch size
-           T = time steps
-           P = EEG channels / graph nodes
-           F = hidden feature dimension
+    def forward(self, x):
+        # x: [N, T, P, H]
+        N, T, P, H = x.shape
+        x_ = x.permute(0, 2, 1, 3).reshape(N * P, T, H)
+        attn_out, attn_weight = self.attn(x_, x_, x_, need_weights=True)
+        x_ = self.norm(x_ + self.dropout(attn_out))
+        x_ = x_.reshape(N, P, T, H).permute(0, 2, 1, 3)
+        return x_, attn_weight
 
-    杈撳嚭:
-        sparse_weights: [N, E]
-           E = num_experts
-    """
 
+class SampleLevelRouter(nn.Module):
     def __init__(
         self,
         hidden_dim,
+        num_points,
         num_experts,
         top_k=2,
+        router_dim=256,
         temperature=1.0,
-        dropout=0.1,
+        dropout=0.2,
     ):
         super().__init__()
-
         assert top_k >= 1, "top_k must be >= 1"
         assert top_k <= num_experts, "top_k must be <= num_experts"
 
-        self.hidden_dim = hidden_dim
-        self.num_experts = num_experts
         self.top_k = top_k
         self.temperature = temperature
+        self.num_experts = num_experts
 
+        in_dim = hidden_dim * num_points
+        self.time_score = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, 1),
+        )
         self.router = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, router_dim),
             nn.LeakyReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_experts),
+            nn.Linear(router_dim, num_experts),
         )
 
     def forward(self, y):
-        # y: [N, T, P, F]
+        # y: [N, T, P, H]
+        N, T, P, H = y.shape
+        y_flat = y.reshape(N, T, P * H)
+        score = self.time_score(y_flat)
+        alpha = torch.softmax(score, dim=1)
+        z = (y_flat * alpha).sum(dim=1)
+        logits = self.router(z) / self.temperature
 
-        # 瀵规椂闂寸淮搴?T 鍜岄€氶亾/鑺傜偣缁村害 P 鍋氬钩鍧囨睜鍖?        # 寰楀埌姣忎釜鏍锋湰鐨?EEG 椋庢牸鍚戦噺
-        # style: [N, F]
-        style = y.mean(dim=(1, 2))
+        topk_values, topk_indices = torch.topk(logits, k=self.top_k, dim=-1)
+        topk_weights = torch.softmax(topk_values, dim=-1)
+        weights = torch.zeros_like(logits)
+        weights.scatter_(dim=-1, index=topk_indices, src=topk_weights)
+        return weights, alpha
 
-        # logits: [N, E]
-        logits = self.router(style)
 
-        # 娓╁害缂╂斁
-        logits = logits / self.temperature
-
-        # 鍙?top-k expert
-        topk_values, topk_indices = torch.topk(
-            logits,
-            k=self.top_k,
-            dim=-1,
+class TemporalAttentionPooling(nn.Module):
+    def __init__(self, hidden_dim, num_points, dropout=0.1):
+        super().__init__()
+        in_dim = hidden_dim * num_points
+        self.score = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, in_dim // 4),
+            nn.LeakyReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(in_dim // 4, 1),
         )
 
-        # 鍙湪 top-k expert 鍐呭仛 softmax
-        topk_weights = torch.softmax(topk_values, dim=-1)
-
-        # Build sparse routing weights over experts.
-        sparse_weights = torch.zeros_like(logits)
-        sparse_weights.scatter_(dim=-1, index=topk_indices, src=topk_weights)
-
-        return sparse_weights
+    def forward(self, y):
+        # y: [N, T, P, H]
+        N, T, P, H = y.shape
+        y_flat = y.reshape(N, T, P * H)
+        score = self.score(y_flat)
+        alpha = torch.softmax(score, dim=1)
+        z = (y_flat * alpha).sum(dim=1)
+        return z, alpha
 
 
 class SampleStyleSparseMoeGCNTransformerUnit(nn.Module):
@@ -219,9 +237,9 @@ class SampleStyleSparseMoeGCNTransformerUnit(nn.Module):
         out_channels,
         num_points,
         heads,
-        dim_head,
         num_experts,
         top_k=2,
+        router_dim=256,
         temperature=1.0,
         dropout=0.2,
         router_mode="learned",
@@ -239,11 +257,12 @@ class SampleStyleSparseMoeGCNTransformerUnit(nn.Module):
         if not 0 <= fixed_expert_index < num_experts:
             raise ValueError("fixed_expert_index must be in [0, num_experts)")
 
-        # 鏍锋湰椋庢牸 top-k 绋€鐤忚矾鐢卞櫒
-        self.router = SampleStyleTopKRouter(
+        self.router = SampleLevelRouter(
             hidden_dim=in_channels,
+            num_points=num_points,
             num_experts=num_experts,
             top_k=top_k,
+            router_dim=router_dim,
             temperature=temperature,
             dropout=dropout,
         )
@@ -262,29 +281,7 @@ class SampleStyleSparseMoeGCNTransformerUnit(nn.Module):
         else:
             self.res_proj = nn.Identity()
 
-        # temporal attention
-        self.attention = nn.Sequential(
-            Attention(
-                in_channels * num_points,
-                heads=heads,
-                dim_head=dim_head,
-                dropout=dropout,
-            ),
-            nn.LayerNorm(in_channels * num_points),
-            nn.LeakyReLU(),
-            nn.Dropout(dropout),
-        )
-
-        # causal temporal convolution
-        self.pad = nn.ZeroPad2d((2, 0, 0, 0))
-        self.causal_conv = nn.Conv2d(
-            in_channels=1,
-            out_channels=1,
-            kernel_size=(1, 3),
-            stride=1,
-        )
-
-        self.squ = nn.Sequential(
+        self.out_norm = nn.Sequential(
             nn.LayerNorm(out_channels * num_points),
             nn.LeakyReLU(),
             nn.Dropout(dropout),
@@ -295,26 +292,16 @@ class SampleStyleSparseMoeGCNTransformerUnit(nn.Module):
     def forward(self, x, A, return_router=False):
         """
         杈撳叆:
-            x: [N, T, P * F]
+            x: [N, T, P, F]
                P = num_points
                F = in_channels
 
             A: [P, P]
 
         杈撳嚭:
-            y: [N, T, P * Fout]
+            y: [N, T, P, Fout]
         """
-
-        # temporal attention
-        y = self.attention(x) + x
-
-        # [N, T, P*F] -> [N, T, P, F]
-        y = rearrange(
-            y,
-            "N T (P F) -> N T P F",
-            P=self.num_points,
-        )
-
+        y = x
         N, T, P, F = y.shape
 
         # 鏍锋湰绾ч鏍艰矾鐢?        # router_weights: [N, E]
@@ -322,7 +309,7 @@ class SampleStyleSparseMoeGCNTransformerUnit(nn.Module):
             router_weights = y.new_zeros((N, self.num_experts))
             router_weights[:, self.fixed_expert_index] = 1.0
         else:
-            router_weights = self.router(y)
+            router_weights, _ = self.router(y)
         self.last_router_weights = router_weights.detach()
 
         # residual path
@@ -344,24 +331,9 @@ class SampleStyleSparseMoeGCNTransformerUnit(nn.Module):
         # MoGE 涓诲共寮忔洿鏂帮細expert 杈撳嚭 + residual
         y = residual + moe_out
 
-        # [N, T, P, Fout] -> [(N*P), Fout, T]
-        y = rearrange(y, "N T P F -> (N P) F T")
-
-        # causal temporal convolution
-        y = self.pad(y)
-        y = y.unsqueeze(1)      # [(N*P), 1, Fout, T+2]
-        y = self.causal_conv(y) # [(N*P), 1, Fout, T]
-        y = y.squeeze(1)        # [(N*P), Fout, T]
-
-        # [(N*P), Fout, T] -> [N, T, P*Fout]
-        y = rearrange(
-            y,
-            "(N P) F T -> N T (P F)",
-            N=N,
-            P=P,
-        )
-
-        y = self.squ(y)
+        y_flat = rearrange(y, "N T P F -> N T (P F)")
+        y_flat = self.out_norm(y_flat)
+        y = rearrange(y_flat, "N T (P F) -> N T P F", P=P)
 
         if return_router:
             return y, router_weights
@@ -407,7 +379,6 @@ class SampleStyleSparseMoGE(nn.Module):
     ):
         super().__init__()
 
-        assert pool in ["cls", "mean"], "pool must be 'cls' or 'mean'"
         assert top_k <= num_experts, "top_k must be <= num_experts"
 
         self.num_points = num_points
@@ -419,20 +390,13 @@ class SampleStyleSparseMoGE(nn.Module):
         self.router_mode = router_mode
         self.fixed_expert_index = fixed_expert_index
 
-        dim = in_channels * num_points
-
-        self.pos_embedding = nn.Parameter(
-            torch.randn(1, time_window + 1, dim)
-        )
-
-        self.cls_token = nn.Parameter(
-            torch.randn(1, 1, dim)
-        )
-
-        self.ln = nn.LayerNorm(dim)
-
         # 灏嗛娈电淮搴?in_channels 鏄犲皠鍒?hidden_channels
         self.embedder = nn.Linear(in_channels, hidden_channels)
+        self.channel_temporal_attn = ChannelWiseTemporalAttention(
+            hidden_dim=hidden_channels,
+            num_heads=heads,
+            dropout=dropout,
+        )
 
         self.layers = nn.ModuleList(
             [
@@ -441,9 +405,9 @@ class SampleStyleSparseMoGE(nn.Module):
                     out_channels=hidden_channels,
                     num_points=num_points,
                     heads=heads,
-                    dim_head=dim_head,
                     num_experts=num_experts,
                     top_k=top_k,
+                    router_dim=256,
                     temperature=temperature,
                     dropout=dropout,
                     router_mode=router_mode,
@@ -453,7 +417,20 @@ class SampleStyleSparseMoGE(nn.Module):
             ]
         )
 
-        self.fc = nn.Linear(hidden_channels * num_points, num_classes)
+        self.temporal_pool = TemporalAttentionPooling(
+            hidden_dim=hidden_channels,
+            num_points=num_points,
+            dropout=dropout,
+        )
+        classifier_in_dim = hidden_channels * num_points
+        classifier_hidden_dim = 256
+        self.classifier_head = nn.Sequential(
+            nn.LayerNorm(classifier_in_dim),
+            nn.Linear(classifier_in_dim, classifier_hidden_dim),
+            nn.LeakyReLU(),
+            nn.Dropout(0.3),
+        )
+        self.fc = nn.Linear(classifier_hidden_dim, num_classes)
 
         # learnable adjacency matrix
         self.xs, self.ys = torch.tril_indices(
@@ -511,28 +488,6 @@ class SampleStyleSparseMoGE(nn.Module):
             f"Expected EEG channels C={self.num_points}, but got C={C}"
         )
 
-        # [N, T, V, C] -> [N, T, V*C]
-        x = x.view(N, T, V * C)
-
-        # add cls token
-        cls_tokens = repeat(
-            self.cls_token,
-            "() T D -> N T D",
-            N=N,
-        )
-
-        x = torch.cat((cls_tokens, x), dim=1)
-
-        # add position embedding
-        x = x + self.pos_embedding[:, : T + 1]
-
-        T = T + 1
-
-        # LayerNorm
-        x = x.view(N * T, V * C)
-        x = self.ln(x)
-        x = x.view(N, T, V, C)
-
         # [N, T, V, C] -> [N, T, C, V]
         # C 鏄?EEG channels锛孷 鏄?frequency bands
         x = rearrange(x, "N T V C -> N T C V")
@@ -540,9 +495,7 @@ class SampleStyleSparseMoGE(nn.Module):
         # 瀵规瘡涓?EEG channel 鐨勯娈电壒寰佸仛 embedding
         # [N, T, C, V] -> [N, T, C, hidden_channels]
         x = self.embedder(x)
-
-        # [N, T, C, hidden] -> [N, T, C*hidden]
-        x = rearrange(x, "N T C F -> N T (C F)")
+        x, _ = self.channel_temporal_attn(x)
 
         adjacency = self.build_adjacency(x.device)
 
@@ -559,12 +512,9 @@ class SampleStyleSparseMoGE(nn.Module):
             else:
                 x = layer(x, adjacency)
 
-        if self.pool == "mean":
-            x = x.mean(dim=1)
-        else:
-            x = x[:, 0]
+        x, _ = self.temporal_pool(x)
 
-        features = x
+        features = self.classifier_head(x)
         out = self.fc(features)
 
         if return_router and return_features:

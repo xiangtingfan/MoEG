@@ -1,10 +1,12 @@
 import argparse
+import csv
+import math
 import os
 
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from data.eeg_dataset import build_datasets_for_loso
 from losses.router_losses import (
@@ -33,6 +35,77 @@ def resolve_device(device_arg):
     return torch.device(device_arg)
 
 
+class SubjectClassBalancedBatchSampler(Sampler):
+    def __init__(
+        self,
+        dataset,
+        subjects_per_batch,
+        classes_per_subject,
+        samples_per_class,
+        num_classes,
+        seed=0,
+    ):
+        self.dataset = dataset
+        self.subjects_per_batch = int(subjects_per_batch)
+        self.classes_per_subject = int(classes_per_subject)
+        self.samples_per_class = int(samples_per_class)
+        self.num_classes = int(num_classes)
+        self.rng = np.random.default_rng(seed)
+
+        subject_ids = dataset.subject_ids.numpy()
+        labels = dataset.y.numpy()
+        self.subjects = sorted(np.unique(subject_ids).astype(int).tolist())
+        self.classes = list(range(self.num_classes))
+        self.indices = {}
+        for subject in self.subjects:
+            for label in self.classes:
+                mask = (subject_ids == subject) & (labels == label)
+                self.indices[(subject, label)] = np.flatnonzero(mask).astype(np.int64)
+
+        self.batch_size = self.subjects_per_batch * self.classes_per_subject * self.samples_per_class
+        self.num_batches = max(1, math.ceil(len(dataset) / self.batch_size))
+
+    def __len__(self):
+        return self.num_batches
+
+    def _choice(self, values, size, replace=False):
+        values = list(values)
+        if len(values) == 0:
+            return []
+        replace = replace or len(values) < size
+        return self.rng.choice(values, size=size, replace=replace).tolist()
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            batch = []
+            selected_subjects = self._choice(
+                self.subjects,
+                self.subjects_per_batch,
+                replace=len(self.subjects) < self.subjects_per_batch,
+            )
+            for subject in selected_subjects:
+                nonempty_classes = [
+                    label for label in self.classes
+                    if len(self.indices[(subject, label)]) > 0
+                ]
+                selected_classes = self._choice(
+                    nonempty_classes,
+                    min(self.classes_per_subject, len(nonempty_classes)),
+                    replace=len(nonempty_classes) < self.classes_per_subject,
+                )
+                for label in selected_classes:
+                    candidates = self.indices[(subject, label)]
+                    replace = len(candidates) < self.samples_per_class
+                    sampled = self.rng.choice(
+                        candidates,
+                        size=self.samples_per_class,
+                        replace=replace,
+                    )
+                    batch.extend(sampled.astype(int).tolist())
+            self.rng.shuffle(batch)
+            yield batch
+
+
 def train_one_epoch(model, loader, optimizer, criterion, device, args):
     model.train()
     total_loss = 0.0
@@ -58,9 +131,21 @@ def train_one_epoch(model, loader, optimizer, criterion, device, args):
         loss_mmd = loss_cls.new_tensor(0.0)
         loss_cmmd = loss_cls.new_tensor(0.0)
         if args.lambda_mmd != 0:
-            loss_mmd = compute_mmd_loss(features, subject_ids).to(device)
+            loss_mmd = compute_mmd_loss(
+                features,
+                subject_ids,
+                kernel_mul=args.cmmd_kernel_mul,
+                kernel_num=args.cmmd_kernel_num,
+            ).to(device)
         if args.lambda_cmmd != 0:
-            loss_cmmd = compute_subject_cmmd_loss(features, y, subject_ids, args.num_classes).to(device)
+            loss_cmmd = compute_subject_cmmd_loss(
+                features,
+                y,
+                subject_ids,
+                args.num_classes,
+                kernel_mul=args.cmmd_kernel_mul,
+                kernel_num=args.cmmd_kernel_num,
+            ).to(device)
         loss_importance = loss_cls.new_tensor(0.0)
         loss_load = loss_cls.new_tensor(0.0)
         loss_balance = loss_cls.new_tensor(0.0)
@@ -68,17 +153,14 @@ def train_one_epoch(model, loader, optimizer, criterion, device, args):
         if args.router_loss_type == "legacy":
             loss_balance = router_balance_loss(router_weights_all).to(device)
             loss_entropy = router_entropy_loss(router_weights_all).to(device)
-            loss_router_balance = loss_balance
-            loss_router_entropy = loss_entropy
+            loss_router = args.lambda_balance * loss_balance + args.lambda_entropy * loss_entropy
         else:
             loss_importance = router_importance_loss(router_weights_all).to(device)
             loss_load = router_load_loss(router_weights_all).to(device)
-            loss_router_balance = loss_importance
-            loss_router_entropy = loss_load
+            loss_router = args.lambda_router * (loss_importance + loss_load)
         loss = (
             loss_cls
-            + args.lambda_balance * loss_router_balance
-            + args.lambda_entropy * loss_router_entropy
+            + loss_router
             + args.lambda_mmd * loss_mmd
             + args.lambda_cmmd * loss_cmmd
         )
@@ -192,14 +274,30 @@ def train_one_target(args, target_subject=None):
         raise ValueError("target_subject {} is outside [0, {})".format(target_subject, args.num_subjects))
     source_dataset, target_dataset, source_subjects = build_datasets_for_loso(args, target_subject)
 
-    source_loader = DataLoader(
-        source_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
-        drop_last=False,
-    )
+    if args.source_sampling == "balanced":
+        source_batch_sampler = SubjectClassBalancedBatchSampler(
+            source_dataset,
+            subjects_per_batch=args.subjects_per_batch,
+            classes_per_subject=args.classes_per_subject,
+            samples_per_class=args.samples_per_class,
+            num_classes=args.num_classes,
+            seed=args.seed + target_subject,
+        )
+        source_loader = DataLoader(
+            source_dataset,
+            batch_sampler=source_batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+        )
+    else:
+        source_loader = DataLoader(
+            source_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+        )
     target_loader = DataLoader(
         target_dataset,
         batch_size=args.batch_size,
@@ -222,6 +320,7 @@ def train_one_target(args, target_subject=None):
         "confusion_matrix": [],
         "router_info": None,
     }
+    history = []
 
     for epoch in range(1, args.epochs + 1):
         train_metrics = train_one_epoch(model, source_loader, optimizer, criterion, device, args)
@@ -237,6 +336,24 @@ def train_one_target(args, target_subject=None):
                 "router_info": router_info,
             }
             torch.save(model.state_dict(), os.path.join(target_dir, "best_model.pt"))
+
+        epoch_record = {
+            "epoch": epoch,
+            "train_loss": train_metrics["loss"],
+            "loss_cls": train_metrics["loss_cls"],
+            "loss_importance": train_metrics["loss_importance"],
+            "loss_load": train_metrics["loss_load"],
+            "loss_mmd": train_metrics["loss_mmd"],
+            "loss_cmmd": train_metrics["loss_cmmd"],
+            "loss_balance_legacy": train_metrics["loss_balance_legacy"],
+            "loss_entropy_legacy": train_metrics["loss_entropy_legacy"],
+            "train_acc": train_metrics["acc"],
+            "target_acc": target_metrics["acc"],
+            "target_macro_f1": target_metrics["macro_f1"],
+            "target_kappa": target_metrics["kappa"],
+            "best_target_acc": best["acc"],
+        }
+        history.append(epoch_record)
 
         print(
             "epoch={epoch} train_loss={train_loss:.6f} "
@@ -278,6 +395,12 @@ def train_one_target(args, target_subject=None):
         "config": vars(args),
     }
     save_json(metrics_json, os.path.join(target_dir, "metrics.json"))
+    save_json(history, os.path.join(target_dir, "history.json"))
+    history_csv_path = os.path.join(target_dir, "history.csv")
+    with open(history_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(history[0].keys()) if history else [])
+        writer.writeheader()
+        writer.writerows(history)
 
     router_info = best["router_info"]
     if router_info is not None:
@@ -298,7 +421,7 @@ def build_arg_parser():
         choices=["sample_style_sparse_moge", "shared_residual_moge"],
         default="sample_style_sparse_moge",
     )
-    parser.add_argument("--dataset_name", type=str, choices=["seed", "seediv"], required=True)
+    parser.add_argument("--dataset_name", type=str, choices=["seed", "seediv", "seedv"], required=True)
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--session", type=int, default=1)
     parser.add_argument("--target_subject", type=int, default=0)
@@ -331,9 +454,16 @@ def build_arg_parser():
     parser.add_argument("--nonnegative_adjacency", action="store_true")
     parser.add_argument("--lambda_balance", type=float, default=0.05)
     parser.add_argument("--lambda_entropy", type=float, default=0.01)
+    parser.add_argument("--lambda_router", type=float, default=0.01)
     parser.add_argument("--lambda_mmd", type=float, default=0.0)
     parser.add_argument("--lambda_cmmd", type=float, default=0.1)
+    parser.add_argument("--cmmd_kernel_mul", type=float, default=2.0)
+    parser.add_argument("--cmmd_kernel_num", type=int, default=5)
     parser.add_argument("--router_loss_type", type=str, choices=["classic", "legacy"], default="classic")
+    parser.add_argument("--source_sampling", type=str, choices=["random", "balanced"], default="random")
+    parser.add_argument("--subjects_per_batch", type=int, default=4)
+    parser.add_argument("--classes_per_subject", type=int, default=4)
+    parser.add_argument("--samples_per_class", type=int, default=8)
     parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--save_dir", type=str, required=True)

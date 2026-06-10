@@ -59,11 +59,32 @@ def router_load_loss(router_weights_all):
     return loss / len(router_weights_all)
 
 
-def compute_mmd_loss(features, subject_ids):
-    """Simplified source-domain MMD: minimize pairwise subject feature mean distance."""
+def mmd(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+    """Gaussian-kernel MMD between two feature sets."""
+    if source.size(0) == 0 or target.size(0) == 0:
+        return source.new_tensor(0.0)
+
+    batch_size_source = int(source.size(0))
+    batch_size_target = int(target.size(0))
+    kernels = gaussian_kernel(
+        source,
+        target,
+        kernel_mul=kernel_mul,
+        kernel_num=kernel_num,
+        fix_sigma=fix_sigma,
+    )
+    xx = kernels[:batch_size_source, :batch_size_source]
+    yy = kernels[batch_size_source:, batch_size_source:]
+    xy = kernels[:batch_size_source, batch_size_source:]
+    yx = kernels[batch_size_source:, :batch_size_source]
+    return xx.mean() + yy.mean() - xy.mean() - yx.mean()
+
+
+def compute_mmd_loss(features, subject_ids, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
+    """Pairwise Gaussian-kernel MMD across source subjects inside one training batch."""
     unique_subjects = torch.unique(subject_ids)
     if len(unique_subjects) < 2:
-        return torch.tensor(0.0, device=features.device)
+        return features.new_tensor(0.0)
 
     mmd_loss = features.new_tensor(0.0)
     count = 0
@@ -77,9 +98,13 @@ def compute_mmd_loss(features, subject_ids):
             features_j = features[subject_ids == subject_j]
 
             if len(features_i) > 0 and len(features_j) > 0:
-                mean_i = features_i.mean(dim=0)
-                mean_j = features_j.mean(dim=0)
-                mmd_loss = mmd_loss + torch.norm(mean_i - mean_j, p=2)
+                mmd_loss = mmd_loss + mmd(
+                    features_i,
+                    features_j,
+                    kernel_mul=kernel_mul,
+                    kernel_num=kernel_num,
+                    fix_sigma=fix_sigma,
+                )
                 count += 1
 
     return mmd_loss / max(count, 1)
@@ -136,7 +161,7 @@ def cmmd(source, target, source_labels, target_labels, num_classes, kernel_mul=2
     return loss_xx + loss_yy - loss_xy - loss_yx
 
 
-def compute_subject_cmmd_loss(features, labels, subject_ids, num_classes):
+def compute_subject_cmmd_loss(features, labels, subject_ids, num_classes, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
     """Pairwise CMMD across source subjects inside one training batch."""
     unique_subjects = torch.unique(subject_ids)
     if len(unique_subjects) < 2:
@@ -158,6 +183,9 @@ def compute_subject_cmmd_loss(features, labels, subject_ids, num_classes):
                     labels[mask_i],
                     labels[mask_j],
                     num_classes=num_classes,
+                    kernel_mul=kernel_mul,
+                    kernel_num=kernel_num,
+                    fix_sigma=fix_sigma,
                 )
                 count += 1
 

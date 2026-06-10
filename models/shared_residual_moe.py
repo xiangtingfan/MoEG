@@ -247,19 +247,27 @@ class SharedResidualMoGE(nn.Module):
             dropout=dropout,
             expert_bottleneck=expert_bottleneck,
         )
-        self.classifier = nn.Linear(dim, num_classes)
+        classifier_hidden_dim = 256
+        self.classifier_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, classifier_hidden_dim),
+            nn.LeakyReLU(),
+            nn.Dropout(0.3),
+        )
+        self.classifier = nn.Linear(classifier_hidden_dim, num_classes)
 
     def forward(self, x, return_router=False, return_features=False):
         z_shared = self.shared_encoder(x)
         z_final, router_weights = self.residual_moe(z_shared)
-        logits = self.classifier(z_final)
+        features = self.classifier_head(z_final)
+        logits = self.classifier(features)
 
         if return_router and return_features:
-            return logits, [router_weights], z_final
+            return logits, [router_weights], features
         if return_router:
             return logits, [router_weights]
         if return_features:
-            return logits, z_final
+            return logits, features
         return logits
 
 
